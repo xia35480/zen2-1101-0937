@@ -1,8 +1,9 @@
-name: zen-gateway
+name: zen-gateway-vpngate
 
-# 一台 runner = 一个出口 IP。额度按 IP 算，所以「换 IP」= 换一台 runner。
-# 4 小时软交班 + 硬超时兜底 + 每 20 分钟 cron 补位，保证链路不断。
-# 网关用仓库里的预编译二进制（bin/zen-direct），不在 runner 上编译。
+# VPNGate / OpenVPN 特例节点模板：
+#   基于 sing-box openvpn-client 接入 VPNGate 节点池，为网关提供住宅/商业宽带出口。
+#   4 小时软交班 + 硬超时兜底 + 故障转移。
+#   网关直接复用预编译二进制（bin/zen-direct）。
 
 on:
   workflow_dispatch:
@@ -16,11 +17,11 @@ on:
 
 permissions:
   contents: read
-  actions: write # 需要它来 dispatch 下一次运行
+  actions: write
 
 concurrency:
   group: zen-gateway
-  cancel-in-progress: false # 让新 run 排队，等旧 run 自己退场
+  cancel-in-progress: false
 
 env:
   PORT: "8081"
@@ -33,7 +34,7 @@ jobs:
     timeout-minutes: 240
 
     steps:
-      - name: Checkout (预编译二进制在这里)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prune old runs (keep 3)
@@ -44,31 +45,61 @@ jobs:
           set -uo pipefail
           repo="${{ github.repository }}"
           keep=3
-          echo "只保留最近 $keep 条已完成的 run，更早的删除"
           gh api "repos/$repo/actions/workflows/gateway.yml/runs?per_page=100" \
             --jq '[.workflow_runs[] | select(.status == "completed")] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
           | while read -r id; do
               [ -n "$id" ] || continue
               [ "$id" = "${{ github.run_id }}" ] && continue
-              if gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1; then
-                echo "deleted run $id"
-              else
-                echo "skip run $id (delete failed)"
-              fi
+              gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1 || true
             done
 
       - name: Check binary
         run: |
           set -euo pipefail
           chmod +x bin/zen-direct
-          ls -l bin/zen-direct
           sha256sum bin/zen-direct
-          # ZEN_PROBE_BODY 指向不存在的文件时二进制读完就退 2，用它确认产物能跑
           rc=0
           ZEN_PROBE_BODY=/nonexistent/zen-probe bin/zen-direct >/dev/null 2>&1 || rc=$?
           if [ "$rc" != "2" ]; then
             echo "::error::bin/zen-direct 跑不起来（rc=$rc）"
             exit 1
+          fi
+
+      - name: Cache sing-box binary
+        id: cache-singbox
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/sing-box
+          key: sing-box-1.14.4-linux-amd64
+
+      - name: Install sing-box
+        if: steps.cache-singbox.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          V="1.14.4"
+          echo "安装 sing-box $V"
+          curl -sL -m 60 -o /tmp/sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v${V}/sing-box-${V}-linux-amd64.tar.gz"
+          tar xzf /tmp/sb.tgz -C /tmp
+          sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version | head -1
+
+      - name: Setup sing-box & VPNGate (50 握手探活 + 20 并发 zen-direct 真实对话探 200 + 早停)
+        run: |
+          set -euo pipefail
+          echo "拉取 VPNGate 节点 (开启 gzip 极速传输)..."
+          curl -s --compressed -m 20 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
+          python3 scripts/probe_and_select_vpngate.py --csv /tmp/vg.csv --output /tmp/sb.json --concurrency 20 --max-candidates 35 --keep-nodes 3 --mixed-port 18080 || true
+
+          if [ -s /tmp/sb.json ]; then
+            sing-box run -c /tmp/sb.json > /tmp/singbox.log 2>&1 &
+            for i in $(seq 1 30); do
+              if (exec 3<>/dev/tcp/127.0.0.1/18080) 2>/dev/null; then exec 3>&-; break; fi
+              sleep 0.1
+            done
+            echo "sing-box 启动完成，监听 127.0.0.1:18080"
+            touch /tmp/vpngate_ready
+          else
+            echo "未筛选出可用节点，使用原生网络兜底"
           fi
 
       - name: Install cloudflared
@@ -85,8 +116,6 @@ jobs:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
           MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
-          # 可选：上游出口代理（GitHub runner 的 Azure IP 常被免费层限掉）。
-          # 在仓库 Variables 里配 PROXY_URL=http://user:pass@host:port 即可。
           PROXY_URL: ${{ vars.PROXY_URL }}
         run: bash scripts/run-gateway.sh
 
@@ -97,8 +126,9 @@ jobs:
         run: |
           reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
           {
-            echo "### zen-gateway"
+            echo "### zen-gateway-vpngate"
             echo ""
+            echo "- 模板类型：\`VPNGate + sing-box OpenVPN\`"
             echo "- 交班原因：\`$reason\`"
             echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
             echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
@@ -116,8 +146,5 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/gateway.yml/dispatches" \
-            -d '{"ref":"main"}' || echo 000)"
+            -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\"}" || echo 000)"
           echo "dispatch next run -> HTTP $code"
-          if [ "$code" != "204" ]; then
-            echo "::warning::下一次运行没派出去（HTTP $code），靠 cron 补位"
-          fi
